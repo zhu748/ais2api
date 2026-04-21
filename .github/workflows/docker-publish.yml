@@ -1,42 +1,89 @@
-# .github/workflows/docker-publish.yml (最终修正版)
-name: Build and Push Docker Image
+name: Build and Publish Package
 
 on:
   push:
-    branches: ["main"] # 当 main 分支有更新时触发
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to publish, for example v1.0.0"
+        required: true
+        default: "manual"
+      latest:
+        description: "Also publish the latest tag"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  build_and_push:
+  build_and_publish:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get Camoufox Download URL
-        id: get_camoufox_url
+      - name: Prepare image metadata
+        id: prep
+        shell: bash
         run: |
-          URL=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | grep "browser_download_url.*camoufox-linux.tar.gz" | cut -d : -f 2,3 | tr -d '", ')
-          echo "CAMOUFOX_URL=$URL" >> $GITHUB_ENV
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          REPO_LC="$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE_NAME="ghcr.io/${OWNER_LC}/${REPO_LC}"
 
-      - name: Log in to Docker Hub
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION_TAG="${{ github.event.inputs.version }}"
+            ADD_LATEST="${{ github.event.inputs.latest }}"
+          else
+            VERSION_TAG="main-${GITHUB_SHA::7}"
+            ADD_LATEST="true"
+          fi
+
+          TAGS="${IMAGE_NAME}:${VERSION_TAG}"
+          if [[ "${ADD_LATEST}" == "true" ]]; then
+            TAGS="${TAGS},${IMAGE_NAME}:latest"
+          fi
+
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Get Camoufox download URL
+        id: get_camoufox_url
+        shell: bash
+        run: |
+          URL="$(curl -fsSL "https://api.github.com/repos/${{ github.repository }}/releases/latest" | grep "browser_download_url.*camoufox-linux.tar.gz" | cut -d : -f 2,3 | tr -d '", ')"
+          echo "CAMOUFOX_URL=${URL}" >> "$GITHUB_ENV"
+
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- 新增：设置一个支持缓存的 Docker Buildx 构建器 ---
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and publish image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ellinalopez/cloud-studio:latest
+          tags: ${{ steps.prep.outputs.tags }}
           build-args: |
             CAMOUFOX_URL=${{ env.CAMOUFOX_URL }}
-          # 缓存功能现在可以正常工作了
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Show published tags
+        shell: bash
+        run: |
+          echo "Published image: ${{ steps.prep.outputs.image_name }}"
+          echo "Published tags: ${{ steps.prep.outputs.tags }}"

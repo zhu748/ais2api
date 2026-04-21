@@ -88,12 +88,15 @@ class RequestProcessor {
     this.activeOperations = new Map();
     this.cancelledOperations = new Set();
     this.targetDomain = "generativelanguage.googleapis.com";
+    this.requestTimeoutMs = 90000;
+    this.bodyReadTimeoutMs = 120000;
     this.maxRetries = 3; // 最多尝试3次
     this.retryDelay = 2000; // 每次重试前等待2秒
   }
 
   execute(requestSpec, operationId) {
-    const IDLE_TIMEOUT_DURATION = 600000;
+    const REQUEST_TIMEOUT_DURATION = this.requestTimeoutMs;
+    const IDLE_TIMEOUT_DURATION = REQUEST_TIMEOUT_DURATION;
     const abortController = new AbortController();
     this.activeOperations.set(operationId, abortController);
 
@@ -107,7 +110,7 @@ class RequestProcessor {
           );
           abortController.abort();
           reject(error);
-        }, IDLE_TIMEOUT_DURATION);
+        }, REQUEST_TIMEOUT_DURATION);
       });
     };
 
@@ -347,6 +350,8 @@ class ProxySystem extends EventTarget {
   async _processProxyRequest(requestSpec) {
     const operationId = requestSpec.request_id;
     const mode = requestSpec.streaming_mode || "fake";
+    const bodyReadTimeoutMs = this.requestProcessor.bodyReadTimeoutMs;
+    let reader = null;
     Logger.output(`浏览器收到请求`);
 
     try {
@@ -363,13 +368,24 @@ class ProxySystem extends EventTarget {
       }
 
       this._transmitHeaders(response, operationId);
-      const reader = response.body.getReader();
+      reader = response.body.getReader();
       const textDecoder = new TextDecoder();
       let fullBody = "";
 
       // [核心修正] 在循环内部正确分发流式和非流式数据
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => {
+              const timeoutError = new Error(
+                `响应体读取超时: ${bodyReadTimeoutMs / 1000} 秒内未收到新数据`
+              );
+              timeoutError.status = 504;
+              reject(timeoutError);
+            }, bodyReadTimeoutMs)
+          ),
+        ]);
         if (done) break;
 
         const chunk = textDecoder.decode(value, { stream: true });
@@ -393,6 +409,11 @@ class ProxySystem extends EventTarget {
 
       this._transmitStreamEnd(operationId);
     } catch (error) {
+      try {
+        if (reader) {
+          await reader.cancel(error.message);
+        }
+      } catch (_) {}
       if (error.name === "AbortError") {
         Logger.output(`[诊断] 操作 #${operationId} 已被用户中止。`);
       } else {

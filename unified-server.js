@@ -1831,6 +1831,18 @@ class RequestHandler {
 
   async _handleRealStreamResponse(proxyRequest, messageQueue, res) {
     this.logger.info(`[Request] 请求已派发给浏览器端处理...`);
+    res.status(200).set({
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
+    if (!res.writableEnded) {
+      res.write(": stream-open\n\n");
+    }
     this._forwardRequest(proxyRequest);
     const headerMessage = await messageQueue.dequeue();
 
@@ -2043,10 +2055,15 @@ class RequestHandler {
   }
 
   _setResponseHeaders(res, headerMessage) {
-    res.status(headerMessage.status || 200);
+    if (!res.headersSent) {
+      res.status(headerMessage.status || 200);
+    }
     const headers = headerMessage.headers || {};
     Object.entries(headers).forEach(([name, value]) => {
-      if (name.toLowerCase() !== "content-length") res.set(name, value);
+      const lowerName = name.toLowerCase();
+      if (lowerName === "content-length") return;
+      if (res.headersSent) return;
+      res.set(name, value);
     });
   }
   _handleRequestError(error, res) {
@@ -3035,20 +3052,52 @@ class ProxyServerSystem extends EventEmitter {
 
     app.use(this._createAuthMiddleware());
 
-    app.get("/v1/models", (req, res) => {
-      const modelIds = this.config.modelList || ["gemini-2.5-pro"];
-
-      const models = modelIds.map((id) => ({
-        id: id,
+    const modelIds = this.config.modelList || ["gemini-2.5-pro"];
+    const buildOpenAIModels = () =>
+      modelIds.map((id) => ({
+        id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "google",
       }));
+    const buildGoogleModel = (id) => ({
+      name: `models/${id}`,
+      version: "proxy-local",
+      displayName: id,
+      description: `Local proxy model entry for ${id}`,
+      supportedGenerationMethods: [
+        "generateContent",
+        "streamGenerateContent",
+      ],
+      inputTokenLimit: 1048576,
+      outputTokenLimit: 8192,
+    });
 
+    app.get("/v1/models", (req, res) => {
       res.status(200).json({
         object: "list",
-        data: models,
+        data: buildOpenAIModels(),
       });
+    });
+
+    app.get("/v1beta/models", (req, res) => {
+      res.status(200).json({
+        models: modelIds.map((id) => buildGoogleModel(id)),
+      });
+    });
+
+    app.get("/v1beta/models/:model", (req, res) => {
+      const modelId = req.params.model.replace(/^models\//, "");
+      if (!modelIds.includes(modelId)) {
+        return res.status(404).json({
+          error: {
+            code: 404,
+            message: `Model not found: ${modelId}`,
+            status: "NOT_FOUND",
+          },
+        });
+      }
+      res.status(200).json(buildGoogleModel(modelId));
     });
 
     app.post("/v1/chat/completions", (req, res) => {
