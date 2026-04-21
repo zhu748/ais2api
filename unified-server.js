@@ -1464,7 +1464,14 @@ class RequestHandler {
 
     try {
       this._forwardRequest(proxyRequest);
-      const initialMessage = await messageQueue.dequeue();
+      const initialMessage = await this._dequeueMessageWithDiagnosis(
+        messageQueue,
+        {
+          requestId,
+          phase: "等待 OpenAI 适配请求首个响应头",
+          timeoutMs: 45000,
+        },
+      );
 
       if (initialMessage.event_type === "error") {
         this.logger.error(
@@ -1486,6 +1493,10 @@ class RequestHandler {
         return;
       }
 
+      this.logger.info(
+        `[Diag] 请求 #${requestId} 已收到首个响应头，OpenAI 适配链路继续处理。`,
+      );
+
       if (this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] OpenAI接口请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`,
@@ -1504,6 +1515,7 @@ class RequestHandler {
           this.logger.info(`[Adapter] OpenAI 流式响应 (Real Mode) 已启动...`);
           let lastGoogleChunk = "";
           const streamState = { inThought: false };
+          let hasLoggedFirstChunk = false;
 
           while (true) {
             const message = await messageQueue.dequeue(300000); // 5分钟超时
@@ -1528,6 +1540,12 @@ class RequestHandler {
               break;
             }
             if (message.data) {
+              if (!hasLoggedFirstChunk) {
+                this.logger.info(
+                  `[Diag] 请求 #${requestId} 已收到首个 OpenAI 流式数据块。`,
+                );
+                hasLoggedFirstChunk = true;
+              }
               // [修改] 将 streamState 传递给翻译函数
               const translatedChunk = this._translateGoogleToOpenAIStream(
                 message.data,
@@ -1545,7 +1563,14 @@ class RequestHandler {
 
           let fullBody = "";
           while (true) {
-            const message = await messageQueue.dequeue(300000);
+            const message = await this._dequeueMessageWithDiagnosis(
+              messageQueue,
+              {
+                requestId,
+                phase: "等待 OpenAI 流式数据块",
+                timeoutMs: 300000,
+              },
+            );
             if (message.type === "STREAM_END") break;
             if (message.data) fullBody += message.data;
           }
@@ -1565,7 +1590,14 @@ class RequestHandler {
       } else {
         let fullBody = "";
         while (true) {
-          const message = await messageQueue.dequeue(300000);
+            const message = await this._dequeueMessageWithDiagnosis(
+              messageQueue,
+              {
+                requestId,
+                phase: "等待 OpenAI 假流式完整响应",
+                timeoutMs: 300000,
+              },
+            );
           if (message.type === "STREAM_END") {
             break;
           }
@@ -1798,14 +1830,28 @@ class RequestHandler {
 
     try {
       this._forwardRequest(proxyRequest);
-      const headerMessage = await messageQueue.dequeue();
+      const headerMessage = await this._dequeueMessageWithDiagnosis(
+        messageQueue,
+        {
+          requestId: proxyRequest.request_id,
+          phase: "等待非流式响应头",
+          timeoutMs: 45000,
+        },
+      );
       if (headerMessage.event_type === "error") {
         throw new Error(headerMessage.message || "Failed to fetch models.");
       }
 
       let fullBody = "";
       while (true) {
-        const message = await messageQueue.dequeue(300000);
+          const message = await this._dequeueMessageWithDiagnosis(
+            messageQueue,
+            {
+              requestId,
+              phase: "等待 OpenAI 非流式完整响应",
+              timeoutMs: 300000,
+            },
+          );
         if (message.type === "STREAM_END") break;
         if (message.event_type === "chunk" && message.data) {
           fullBody += message.data;
@@ -2080,7 +2126,11 @@ class RequestHandler {
       res.write(": stream-open\n\n");
     }
     this._forwardRequest(proxyRequest);
-    const headerMessage = await messageQueue.dequeue();
+    const headerMessage = await this._dequeueMessageWithDiagnosis(messageQueue, {
+      requestId: proxyRequest.request_id,
+      phase: "等待真实流式响应头",
+      timeoutMs: 45000,
+    });
 
     if (headerMessage.event_type === "error") {
       if (
@@ -2116,13 +2166,27 @@ class RequestHandler {
     this.logger.info("[Request] 开始流式传输...");
     try {
       let lastChunk = "";
+      let hasLoggedFirstChunk = false;
       while (true) {
-        const dataMessage = await messageQueue.dequeue(30000);
+        const dataMessage = await this._dequeueMessageWithDiagnosis(
+          messageQueue,
+          {
+            requestId: proxyRequest.request_id,
+            phase: "等待真实流式数据块",
+            timeoutMs: 30000,
+          },
+        );
         if (dataMessage.type === "STREAM_END") {
           this.logger.info("[Request] 收到流结束信号。");
           break;
         }
         if (dataMessage.data) {
+          if (!hasLoggedFirstChunk) {
+            this.logger.info(
+              `[Diag] 请求 #${proxyRequest.request_id} 已收到首个真实流式数据块。`,
+            );
+            hasLoggedFirstChunk = true;
+          }
           res.write(dataMessage.data);
           lastChunk = dataMessage.data;
         }
@@ -2141,7 +2205,7 @@ class RequestHandler {
         }
       } catch (e) {}
     } catch (error) {
-      if (error.message !== "Queue timeout") throw error;
+      throw error;
       this.logger.warn("[Request] 真流式响应超时，可能流已正常结束。");
     } finally {
       if (!res.writableEnded) res.end();
@@ -2182,7 +2246,14 @@ class RequestHandler {
       // 2. 准备一个缓冲区，并确保循环等待直到收到结束信号
       let fullBody = "";
       while (true) {
-        const message = await messageQueue.dequeue(300000);
+        const message = await this._dequeueMessageWithDiagnosis(
+          messageQueue,
+          {
+            requestId: proxyRequest.request_id,
+            phase: "等待非流式完整响应",
+            timeoutMs: 300000,
+          },
+        );
         if (message.type === "STREAM_END") {
           this.logger.info("[Request] 收到结束信号，数据接收完毕。");
           break;
@@ -2302,6 +2373,41 @@ class RequestHandler {
       res.set(name, value);
     });
   }
+
+  async _dequeueMessageWithDiagnosis(
+    messageQueue,
+    { requestId, phase, timeoutMs, cancelOnTimeout = true },
+  ) {
+    try {
+      return await messageQueue.dequeue(timeoutMs);
+    } catch (error) {
+      if (error.message === "Queue timeout") {
+        const connectionActive = this.connectionRegistry.hasActiveConnections();
+        const diagnosis = connectionActive
+          ? "浏览器仍在线，但上游请求或浏览器处理可能卡住"
+          : "浏览器 WebSocket 连接已丢失";
+        this.logger.error(
+          `[Diag] 请求 #${requestId} 在阶段 "${phase}" 超时: ${diagnosis}`,
+        );
+        if (cancelOnTimeout) {
+          this._cancelBrowserRequest(requestId);
+        }
+        const timeoutError = new Error(
+          `[${phase}] ${diagnosis}`,
+        );
+        timeoutError.status = connectionActive ? 504 : 503;
+        throw timeoutError;
+      }
+      if (error.message === "Queue closed") {
+        const closedError = new Error(
+          `[${phase}] 浏览器连接中断，等待队列已关闭`,
+        );
+        closedError.status = 503;
+        throw closedError;
+      }
+      throw error;
+    }
+  }
   _handleRequestError(error, res) {
     if (res.headersSent) {
       this.logger.error(`[Request] 请求处理错误 (头已发送): ${error.message}`);
@@ -2310,7 +2416,8 @@ class RequestHandler {
       if (!res.writableEnded) res.end();
     } else {
       this.logger.error(`[Request] 请求处理错误: ${error.message}`);
-      const status = error.message.includes("超时") ? 504 : 500;
+      const status =
+        error.status || (error.message.includes("超时") ? 504 : 500);
       this._sendErrorResponse(res, status, `代理错误: ${error.message}`);
     }
   }
