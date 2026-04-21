@@ -3036,6 +3036,10 @@ class ProxyServerSystem extends EventEmitter {
         <div id="actions-section" style="margin-top: 2em;">
             <h2>操作面板</h2>
             <div class="action-group">
+                <select id="streamModeSelect">
+                    <option value="real">real</option>
+                    <option value="fake">fake</option>
+                </select>
                 <select id="accountIndexSelect">${accountOptionsHtml}</select>
                 <button onclick="switchSpecificAccount()">切换账号</button>
                 <button onclick="toggleStreamingMode()">切换流模式</button>
@@ -3053,9 +3057,14 @@ class ProxyServerSystem extends EventEmitter {
         function updateContent() {
             fetch('/api/status').then(response => response.json()).then(data => {
                 const statusPre = document.querySelector('#status-section pre');
+                const streamModeSelect = document.getElementById('streamModeSelect');
                 const accountDetailsHtml = data.status.accountDetails.map(acc => {
                   return '<span class="label" style="padding-left: 20px;">账号' + acc.index + '</span>: ' + acc.name;
                 }).join('\\n');
+                const currentStreamingMode = String(data.status.streamingMode || '').split(' ')[0];
+                if (streamModeSelect && (currentStreamingMode === 'real' || currentStreamingMode === 'fake')) {
+                    streamModeSelect.value = currentStreamingMode;
+                }
                 statusPre.innerHTML = 
                     '<span class="label">服务状态</span>: <span class="status-ok">Running</span>\\n' +
                     '<span class="label">浏览器连接</span>: <span class="' + (data.status.browserConnected ? "status-ok" : "status-error") + '">' + data.status.browserConnected + '</span>\\n' +
@@ -3120,6 +3129,22 @@ class ProxyServerSystem extends EventEmitter {
             } 
         }
 
+        function toggleStreamingMode() {
+            const selectElement = document.getElementById('streamModeSelect');
+            const newMode = selectElement ? selectElement.value : '';
+            if (newMode === 'fake' || newMode === 'real') {
+                fetch('/api/set-mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode: newMode })
+                })
+                .then(res => res.text()).then(data => { alert(data); updateContent(); })
+                .catch(err => alert('设置失败: ' + err));
+            } else {
+                alert('请选择有效的流模式。');
+            }
+        }
+
         function toggleForceThinking() {
             fetch('/api/toggle-force-thinking', { 
                 method: 'POST', 
@@ -3139,7 +3164,7 @@ class ProxyServerSystem extends EventEmitter {
         }
 
         function viewModels() {
-            fetch('/v1beta/models')
+            fetch('/api/models')
             .then(res => res.json())
             .then(data => {
                 const models = Array.isArray(data.models) ? data.models : [];
@@ -3279,6 +3304,18 @@ class ProxyServerSystem extends EventEmitter {
           .send(`模型列表已刷新，当前共 ${models.models.length} 个模型。`);
       } catch (error) {
         res.status(500).send(`刷新模型列表失败: ${error.message}`);
+      }
+    });
+    app.get("/api/models", isAuthenticated, async (req, res) => {
+      try {
+        const models = await this.requestHandler.getGoogleModelsResponse();
+        res.status(200).json(models);
+      } catch (error) {
+        res.status(500).json({
+          error: {
+            message: error.message,
+          },
+        });
       }
     });
 
