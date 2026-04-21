@@ -1036,7 +1036,21 @@ class RequestHandler {
   }
 
   _getModelSourceModeLabel() {
-    return this.useFallbackModelSourceOnly ? "备用模型" : "远程缓存";
+    return this.useFallbackModelSourceOnly
+      ? "备用本地模型"
+      : "官方远程模型";
+  }
+
+  setModelSourceMode(useFallbackOnly) {
+    this.useFallbackModelSourceOnly = !!useFallbackOnly;
+    this._clearModelCache();
+    this.logger.info(
+      `[Models] 模型拉取方式已切换为: ${this._getModelSourceModeLabel()}`,
+    );
+    return {
+      success: true,
+      modelSourceMode: this._getModelSourceModeLabel(),
+    };
   }
 
   async forceRestartBrowser(options = {}) {
@@ -3173,6 +3187,7 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">强制推理</span>: ${
         this.forceThinking ? "✅ 已启用" : "❌ 已关闭"
       }
+<span class="label">模型拉取方式</span>: ${requestHandler._getModelSourceModeLabel()}
 <span class="label">立即切换 (状态码)</span>: ${
         config.immediateSwitchStatusCodes.length > 0
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
@@ -3207,10 +3222,8 @@ class ProxyServerSystem extends EventEmitter {
                 <button onclick="switchSpecificAccount()">切换账号</button>
                 <button onclick="toggleStreamingMode()">切换流模式</button>
                 <button onclick="toggleForceThinking()">切换强制推理</button>
-                <button onclick="refreshModels()">刷新模型列表</button>
-                <button onclick="viewModels()">查看模型列表</button>
                 <button onclick="forceRestart()">强制重启</button>
-                <button onclick="restartWithFallbackModels()">重启并切备用模型</button>
+                <button onclick="toggleModelSourceMode()">切换模型拉取方式</button>
             </div>
         </div>
         <div id="log-section" style="margin-top: 2em;">
@@ -3236,6 +3249,7 @@ class ProxyServerSystem extends EventEmitter {
                     '--- 服务配置 ---\\n' +
                     '<span class="label">流模式</span>: ' + data.status.streamingMode + '\\n' +
                     '<span class="label">强制推理</span>: ' + data.status.forceThinking + '\\n' +
+                    '<span class="label">模型拉取方式</span>: ' + data.status.modelSourceMode + '\\n' +
                     '<span class="label">立即切换 (状态码)</span>: ' + data.status.immediateSwitchStatusCodes + '\\n' +
                     '<span class="label">API 密钥</span>: ' + data.status.apiKeySource + '\\n' +
                     '--- 账号状态 ---\\n' +
@@ -3319,29 +3333,6 @@ class ProxyServerSystem extends EventEmitter {
             .catch(err => alert('设置失败: ' + err));
         }
 
-        function refreshModels() {
-            fetch('/api/refresh-models', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            })
-            .then(res => res.text()).then(data => { alert(data); updateContent(); })
-            .catch(err => alert('刷新模型列表失败: ' + err));
-        }
-
-        function viewModels() {
-            fetch('/api/models')
-            .then(res => res.json())
-            .then(data => {
-                const models = Array.isArray(data.models) ? data.models : [];
-                const names = models.map(item => String(item.name || '').replace(/^models\\//, ''));
-                const content = names.length
-                    ? '当前模型数量: ' + names.length + '\\n\\n' + names.join('\\n')
-                    : '当前没有可显示的模型列表。';
-                alert(content);
-            })
-            .catch(err => alert('查看模型列表失败: ' + err));
-        }
-
         function forceRestart() {
             if (!confirm('确定要强制重启当前浏览器会话吗？')) {
                 return;
@@ -3354,16 +3345,21 @@ class ProxyServerSystem extends EventEmitter {
             .catch(err => alert('强制重启失败: ' + err));
         }
 
-        function restartWithFallbackModels() {
-            if (!confirm('确定要重启并切换到备用模型模式吗？')) {
+        function toggleModelSourceMode() {
+            const statusPre = document.querySelector('#status-section pre');
+            const currentText = statusPre ? statusPre.innerText : '';
+            const usingFallback = currentText.includes('模型拉取方式: 备用本地模型');
+            const targetModeLabel = usingFallback ? '官方远程模型' : '备用本地模型';
+            if (!confirm('确定要切换模型拉取方式到“' + targetModeLabel + '”吗？')) {
                 return;
             }
-            fetch('/api/restart-fallback-models', {
+            fetch('/api/toggle-model-source', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ useFallbackModelSourceOnly: !usingFallback })
             })
             .then(res => res.text()).then(data => { alert(data); updateContent(); })
-            .catch(err => alert('重启备用模型模式失败: ' + err));
+            .catch(err => alert('切换模型拉取方式失败: ' + err));
         }
 
         document.addEventListener('DOMContentLoaded', () => {
@@ -3508,6 +3504,19 @@ class ProxyServerSystem extends EventEmitter {
         });
       }
     });
+    app.post("/api/toggle-model-source", isAuthenticated, (req, res) => {
+      try {
+        const useFallbackModelSourceOnly = !!req.body.useFallbackModelSourceOnly;
+        const result = this.requestHandler.setModelSourceMode(
+          useFallbackModelSourceOnly,
+        );
+        res
+          .status(200)
+          .send(`模型拉取方式已切换为: ${result.modelSourceMode}`);
+      } catch (error) {
+        res.status(500).send(`切换模型拉取方式失败: ${error.message}`);
+      }
+    });
     app.post("/api/force-restart", isAuthenticated, async (req, res) => {
       try {
         const result = await this.requestHandler.forceRestartBrowser({
@@ -3522,24 +3531,6 @@ class ProxyServerSystem extends EventEmitter {
         res.status(500).send(`强制重启失败: ${error.message}`);
       }
     });
-    app.post(
-      "/api/restart-fallback-models",
-      isAuthenticated,
-      async (req, res) => {
-        try {
-          const result = await this.requestHandler.forceRestartBrowser({
-            fallbackOnly: true,
-          });
-          res
-            .status(200)
-            .send(
-              `已重启并切换到备用模型模式，当前账号 #${result.newIndex}，模型来源: ${result.modelSourceMode}`,
-            );
-        } catch (error) {
-          res.status(500).send(`重启备用模型模式失败: ${error.message}`);
-        }
-      },
-    );
 
     app.use(this._createAuthMiddleware());
 
