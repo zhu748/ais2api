@@ -1022,10 +1022,52 @@ class RequestHandler {
     this.modelsCacheExpiresAt = 0;
     this.modelsRefreshPromise = null;
     this.modelsCacheTtlMs = this.config.modelsCacheTtlMs || 15 * 60 * 1000;
+    this.useFallbackModelSourceOnly = false;
   }
 
   get currentAuthIndex() {
     return this.browserManager.currentAuthIndex;
+  }
+
+  _clearModelCache() {
+    this.modelsCache = null;
+    this.modelsCacheExpiresAt = 0;
+    this.modelsRefreshPromise = null;
+  }
+
+  _getModelSourceModeLabel() {
+    return this.useFallbackModelSourceOnly ? "备用模型" : "远程缓存";
+  }
+
+  async forceRestartBrowser(options = {}) {
+    const { fallbackOnly = false } = options;
+
+    if (this.isAuthSwitching) {
+      return { success: false, reason: "系统正在切换账号，请稍后再试。" };
+    }
+
+    this.isSystemBusy = true;
+    this.useFallbackModelSourceOnly = fallbackOnly;
+    this._clearModelCache();
+
+    try {
+      await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
+      this.failureCount = 0;
+      this.usageCount = 0;
+      this.logger.info(
+        `[System] 浏览器已强制重启，模型源模式: ${this._getModelSourceModeLabel()}`,
+      );
+      return {
+        success: true,
+        newIndex: this.currentAuthIndex,
+        modelSourceMode: this._getModelSourceModeLabel(),
+      };
+    } catch (error) {
+      this.logger.error(`[System] 强制重启失败: ${error.message}`);
+      throw error;
+    } finally {
+      this.isSystemBusy = false;
+    }
   }
 
   _getMaxAuthIndex() {
@@ -1666,6 +1708,13 @@ class RequestHandler {
   }
 
   async refreshGoogleModelsCache(forceRefresh = false) {
+    if (this.useFallbackModelSourceOnly) {
+      const fallbackModels = this._buildFallbackGoogleModels();
+      this.modelsCache = fallbackModels;
+      this.modelsCacheExpiresAt = Date.now() + this.modelsCacheTtlMs;
+      return fallbackModels;
+    }
+
     const cacheStillValid =
       this.modelsCache && Date.now() < this.modelsCacheExpiresAt;
     if (!forceRefresh && cacheStillValid) {
@@ -1695,6 +1744,13 @@ class RequestHandler {
 
   async getGoogleModelsResponse(options = {}) {
     const { forceRefresh = false } = options;
+    if (this.useFallbackModelSourceOnly) {
+      const fallbackModels = this._buildFallbackGoogleModels();
+      this.modelsCache = fallbackModels;
+      this.modelsCacheExpiresAt = Date.now() + this.modelsCacheTtlMs;
+      return fallbackModels;
+    }
+
     if (forceRefresh) {
       return this.refreshGoogleModelsCache(true);
     }
@@ -3046,6 +3102,8 @@ class ProxyServerSystem extends EventEmitter {
                 <button onclick="toggleForceThinking()">切换强制推理</button>
                 <button onclick="refreshModels()">刷新模型列表</button>
                 <button onclick="viewModels()">查看模型列表</button>
+                <button onclick="forceRestart()">强制重启</button>
+                <button onclick="restartWithFallbackModels()">重启并切备用模型</button>
             </div>
         </div>
         <div id="log-section" style="margin-top: 2em;">
@@ -3177,6 +3235,30 @@ class ProxyServerSystem extends EventEmitter {
             .catch(err => alert('查看模型列表失败: ' + err));
         }
 
+        function forceRestart() {
+            if (!confirm('确定要强制重启当前浏览器会话吗？')) {
+                return;
+            }
+            fetch('/api/force-restart', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => alert('强制重启失败: ' + err));
+        }
+
+        function restartWithFallbackModels() {
+            if (!confirm('确定要重启并切换到备用模型模式吗？')) {
+                return;
+            }
+            fetch('/api/restart-fallback-models', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => alert('重启备用模型模式失败: ' + err));
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             updateContent(); 
             setInterval(updateContent, 5000);
@@ -3214,6 +3296,7 @@ class ProxyServerSystem extends EventEmitter {
               ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
               : "已禁用",
           apiKeySource: config.apiKeySource,
+          modelSourceMode: requestHandler._getModelSourceModeLabel(),
           currentAuthIndex: requestHandler.currentAuthIndex,
           usageCount: `${requestHandler.usageCount} / ${
             config.switchOnUses > 0 ? config.switchOnUses : "N/A"
@@ -3318,6 +3401,38 @@ class ProxyServerSystem extends EventEmitter {
         });
       }
     });
+    app.post("/api/force-restart", isAuthenticated, async (req, res) => {
+      try {
+        const result = await this.requestHandler.forceRestartBrowser({
+          fallbackOnly: false,
+        });
+        res
+          .status(200)
+          .send(
+            `强制重启成功，当前账号 #${result.newIndex}，模型来源: ${result.modelSourceMode}`,
+          );
+      } catch (error) {
+        res.status(500).send(`强制重启失败: ${error.message}`);
+      }
+    });
+    app.post(
+      "/api/restart-fallback-models",
+      isAuthenticated,
+      async (req, res) => {
+        try {
+          const result = await this.requestHandler.forceRestartBrowser({
+            fallbackOnly: true,
+          });
+          res
+            .status(200)
+            .send(
+              `已重启并切换到备用模型模式，当前账号 #${result.newIndex}，模型来源: ${result.modelSourceMode}`,
+            );
+        } catch (error) {
+          res.status(500).send(`重启备用模型模式失败: ${error.message}`);
+        }
+      },
+    );
 
     app.use(this._createAuthMiddleware());
 
