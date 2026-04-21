@@ -1018,6 +1018,10 @@ class RequestHandler {
     this.isAuthSwitching = false;
     this.needsSwitchingAfterRequest = false;
     this.isSystemBusy = false;
+    this.modelsCache = null;
+    this.modelsCacheExpiresAt = 0;
+    this.modelsRefreshPromise = null;
+    this.modelsCacheTtlMs = this.config.modelsCacheTtlMs || 15 * 60 * 1000;
   }
 
   get currentAuthIndex() {
@@ -1606,6 +1610,182 @@ class RequestHandler {
         res.end();
       }
     }
+  }
+
+  async processOpenAIModelsRequest(req, res) {
+    if (this.browserManager) {
+      this.browserManager.notifyUserActivity();
+    }
+
+    try {
+      const googleModels = await this.getGoogleModelsResponse();
+      const openAIModels = this._translateGoogleModelsToOpenAIList(googleModels);
+      res.status(200).json(openAIModels);
+    } catch (error) {
+      this._handleRequestError(error, res);
+    }
+  }
+
+  async processGoogleModelsRequest(req, res) {
+    if (this.browserManager) {
+      this.browserManager.notifyUserActivity();
+    }
+
+    try {
+      const googleModels = await this.getGoogleModelsResponse();
+      res.status(200).json(googleModels);
+    } catch (error) {
+      this._handleRequestError(error, res);
+    }
+  }
+
+  async processGoogleModelRequest(req, res) {
+    if (this.browserManager) {
+      this.browserManager.notifyUserActivity();
+    }
+
+    try {
+      const modelName = req.params.model.replace(/^models\//, "");
+      const googleModels = await this.getGoogleModelsResponse();
+      const model = (googleModels.models || []).find(
+        (item) => String(item.name || "").replace(/^models\//, "") === modelName,
+      );
+      if (!model) {
+        return res.status(404).json({
+          error: {
+            code: 404,
+            message: `Model not found: ${modelName}`,
+            status: "NOT_FOUND",
+          },
+        });
+      }
+      res.status(200).json(model);
+    } catch (error) {
+      this._handleRequestError(error, res);
+    }
+  }
+
+  async refreshGoogleModelsCache(forceRefresh = false) {
+    const cacheStillValid =
+      this.modelsCache && Date.now() < this.modelsCacheExpiresAt;
+    if (!forceRefresh && cacheStillValid) {
+      return this.modelsCache;
+    }
+
+    if (this.modelsRefreshPromise) {
+      return this.modelsRefreshPromise;
+    }
+
+    this.modelsRefreshPromise = (async () => {
+      const freshModels = await this._fetchGoogleModelsFromBrowser();
+      this.modelsCache = freshModels;
+      this.modelsCacheExpiresAt = Date.now() + this.modelsCacheTtlMs;
+      this.logger.info(
+        `[Models] 已刷新模型缓存，共 ${freshModels.models.length} 个模型。`,
+      );
+      return freshModels;
+    })();
+
+    try {
+      return await this.modelsRefreshPromise;
+    } finally {
+      this.modelsRefreshPromise = null;
+    }
+  }
+
+  async getGoogleModelsResponse(options = {}) {
+    const { forceRefresh = false } = options;
+    if (forceRefresh) {
+      return this.refreshGoogleModelsCache(true);
+    }
+
+    if (this.modelsCache && Date.now() < this.modelsCacheExpiresAt) {
+      return this.modelsCache;
+    }
+
+    if (this.modelsCache) {
+      this.refreshGoogleModelsCache().catch((error) => {
+        this.logger.warn(`[Models] 后台刷新模型缓存失败: ${error.message}`);
+      });
+      this.logger.info("[Models] 返回上一次成功的模型缓存，并在后台刷新。");
+      return this.modelsCache;
+    }
+
+    try {
+      return await this.refreshGoogleModelsCache();
+    } catch (error) {
+      const fallbackModels = this._buildFallbackGoogleModels();
+      if (fallbackModels.models.length > 0) {
+        this.logger.warn(
+          `[Models] 远程拉取失败，回退到本地 models.json 列表: ${error.message}`,
+        );
+        this.modelsCache = fallbackModels;
+        this.modelsCacheExpiresAt = Date.now() + 60 * 1000;
+        return fallbackModels;
+      }
+      throw error;
+    }
+  }
+
+  async _fetchGoogleModelsFromBrowser() {
+    const requestId = this._generateRequestId();
+    const proxyRequest = {
+      path: "/v1beta/models",
+      method: "GET",
+      headers: {},
+      query_params: {},
+      body: "",
+      request_id: requestId,
+      streaming_mode: "fake",
+    };
+    const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
+
+    try {
+      this._forwardRequest(proxyRequest);
+      const headerMessage = await messageQueue.dequeue();
+      if (headerMessage.event_type === "error") {
+        throw new Error(headerMessage.message || "Failed to fetch models.");
+      }
+
+      let fullBody = "";
+      while (true) {
+        const message = await messageQueue.dequeue(300000);
+        if (message.type === "STREAM_END") break;
+        if (message.event_type === "chunk" && message.data) {
+          fullBody += message.data;
+        }
+      }
+      return this._normalizeGoogleModelsResponse(fullBody);
+    } finally {
+      this.connectionRegistry.removeMessageQueue(requestId);
+    }
+  }
+
+  _normalizeGoogleModelsResponse(googleModelsBody) {
+    const parsed =
+      typeof googleModelsBody === "string"
+        ? JSON.parse(googleModelsBody || "{}")
+        : googleModelsBody || {};
+    const models = Array.isArray(parsed.models) ? parsed.models : [];
+    return { models };
+  }
+
+  _buildFallbackGoogleModels() {
+    const modelIds = Array.isArray(this.config.modelList) ? this.config.modelList : [];
+    return {
+      models: modelIds.map((id) => ({
+        name: `models/${id}`,
+        version: "proxy-local",
+        displayName: id,
+        description: `Fallback model entry for ${id}`,
+        supportedGenerationMethods: [
+          "generateContent",
+          "streamGenerateContent",
+        ],
+        inputTokenLimit: 1048576,
+        outputTokenLimit: 8192,
+      })),
+    };
   }
 
   // --- 新增一个辅助方法，用于发送取消指令 ---
@@ -2342,6 +2522,20 @@ class RequestHandler {
 
     return `data: ${JSON.stringify(openaiResponse)}\n\n`;
   }
+
+  _translateGoogleModelsToOpenAIList(googleModelsBody) {
+    const normalized = this._normalizeGoogleModelsResponse(googleModelsBody);
+    const models = normalized.models;
+    return {
+      object: "list",
+      data: models.map((model) => ({
+        id: String(model.name || "").replace(/^models\//, ""),
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "google",
+      })),
+    };
+  }
 }
 
 class ProxyServerSystem extends EventEmitter {
@@ -3050,54 +3244,29 @@ class ProxyServerSystem extends EventEmitter {
       res.status(200).send(`强制推理模式: ${statusText}`);
     });
 
+    app.post("/api/refresh-models", isAuthenticated, async (req, res) => {
+      try {
+        const models = await this.requestHandler.getGoogleModelsResponse({
+          forceRefresh: true,
+        });
+        res
+          .status(200)
+          .send(`模型列表已刷新，当前共 ${models.models.length} 个模型。`);
+      } catch (error) {
+        res.status(500).send(`刷新模型列表失败: ${error.message}`);
+      }
+    });
+
     app.use(this._createAuthMiddleware());
 
-    const modelIds = this.config.modelList || ["gemini-2.5-pro"];
-    const buildOpenAIModels = () =>
-      modelIds.map((id) => ({
-        id,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "google",
-      }));
-    const buildGoogleModel = (id) => ({
-      name: `models/${id}`,
-      version: "proxy-local",
-      displayName: id,
-      description: `Local proxy model entry for ${id}`,
-      supportedGenerationMethods: [
-        "generateContent",
-        "streamGenerateContent",
-      ],
-      inputTokenLimit: 1048576,
-      outputTokenLimit: 8192,
-    });
-
     app.get("/v1/models", (req, res) => {
-      res.status(200).json({
-        object: "list",
-        data: buildOpenAIModels(),
-      });
+      this.requestHandler.processOpenAIModelsRequest(req, res);
     });
-
     app.get("/v1beta/models", (req, res) => {
-      res.status(200).json({
-        models: modelIds.map((id) => buildGoogleModel(id)),
-      });
+      this.requestHandler.processGoogleModelsRequest(req, res);
     });
-
     app.get("/v1beta/models/:model", (req, res) => {
-      const modelId = req.params.model.replace(/^models\//, "");
-      if (!modelIds.includes(modelId)) {
-        return res.status(404).json({
-          error: {
-            code: 404,
-            message: `Model not found: ${modelId}`,
-            status: "NOT_FOUND",
-          },
-        });
-      }
-      res.status(200).json(buildGoogleModel(modelId));
+      this.requestHandler.processGoogleModelRequest(req, res);
     });
 
     app.post("/v1/chat/completions", (req, res) => {
