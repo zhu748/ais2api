@@ -3040,6 +3040,8 @@ class ProxyServerSystem extends EventEmitter {
                 <button onclick="switchSpecificAccount()">切换账号</button>
                 <button onclick="toggleStreamingMode()">切换流模式</button>
                 <button onclick="toggleForceThinking()">切换强制推理</button>
+                <button onclick="refreshModels()">刷新模型列表</button>
+                <button onclick="viewModels()">查看模型列表</button>
             </div>
         </div>
         <div id="log-section" style="margin-top: 2em;">
@@ -3125,6 +3127,29 @@ class ProxyServerSystem extends EventEmitter {
             })
             .then(res => res.text()).then(data => { alert(data); updateContent(); })
             .catch(err => alert('设置失败: ' + err));
+        }
+
+        function refreshModels() {
+            fetch('/api/refresh-models', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => alert('刷新模型列表失败: ' + err));
+        }
+
+        function viewModels() {
+            fetch('/v1beta/models')
+            .then(res => res.json())
+            .then(data => {
+                const models = Array.isArray(data.models) ? data.models : [];
+                const names = models.map(item => String(item.name || '').replace(/^models\\//, ''));
+                const content = names.length
+                    ? '当前模型数量: ' + names.length + '\\n\\n' + names.join('\\n')
+                    : '当前没有可显示的模型列表。';
+                alert(content);
+            })
+            .catch(err => alert('查看模型列表失败: ' + err));
         }
 
         document.addEventListener('DOMContentLoaded', () => {
