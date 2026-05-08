@@ -1450,7 +1450,7 @@ class RequestHandler {
 
     let googleBody;
     try {
-      googleBody = this._translateOpenAIToGoogle(req.body, model);
+      googleBody = await this._translateOpenAIToGoogle(req.body, model);
     } catch (error) {
       this.logger.error(`[Adapter] OpenAI请求翻译失败: ${error.message}`);
       return this._sendErrorResponse(
@@ -2454,7 +2454,7 @@ class RequestHandler {
     }
   }
 
-  _translateOpenAIToGoogle(openaiBody, modelName = "") {
+  async _translateOpenAIToGoogle(openaiBody, modelName = "") {
     this.logger.info("[Adapter] 开始将OpenAI请求格式翻译为Google格式...");
 
     let systemInstruction = null;
@@ -2489,19 +2489,52 @@ class RequestHandler {
         // b. 如果是图文混合内容
         for (const part of message.content) {
           if (part.type === "text") {
-            googleParts.push({ text: part.text });
+            googleParts.push({ text: part.text || "" });
           } else if (part.type === "image_url" && part.image_url) {
-            // 从 data URL 中提取 mimetype 和 base64 数据
-            const dataUrl = part.image_url.url;
-            const match = dataUrl.match(/^data:(image\/.*?);base64,(.*)$/);
-            if (match) {
+            // 兼容 OpenAI 格式：image_url 可能是字符串，也可能是对象 { url, detail }
+            const rawImageUrl =
+              typeof part.image_url === "string"
+                ? part.image_url
+                : part.image_url.url;
+
+            if (typeof rawImageUrl !== "string" || !rawImageUrl.trim()) {
+              this.logger.warn("[Adapter] 收到无效 image_url，已忽略该图片 part。");
+              continue;
+            }
+
+            const imageUrl = rawImageUrl.trim();
+            // 支持 data URL（base64）
+            const dataUrlMatch = imageUrl.match(
+              /^data:(image\/[^;]+);base64,([\s\S]+)$/i,
+            );
+            if (dataUrlMatch) {
               googleParts.push({
                 inlineData: {
-                  mimeType: match[1],
-                  data: match[2],
+                  mimeType: dataUrlMatch[1].toLowerCase(),
+                  data: dataUrlMatch[2],
                 },
               });
+              continue;
             }
+
+            // 支持远程 URL：在代理层下载后转为 inlineData，避免 fileUri 不可用导致失败
+            if (/^https?:\/\//i.test(imageUrl)) {
+              try {
+                const inlineData =
+                  await this._fetchRemoteImageAsInlineData(imageUrl);
+                googleParts.push({ inlineData });
+                continue;
+              } catch (error) {
+                this.logger.warn(
+                  `[Adapter] 远程图片下载失败，已忽略该图片 part: ${error.message}`,
+                );
+                continue;
+              }
+            }
+
+            this.logger.warn(
+              "[Adapter] image_url 非 data URL/HTTP URL，已忽略该图片 part。",
+            );
           }
         }
       }
@@ -2601,6 +2634,29 @@ class RequestHandler {
 
     this.logger.info("[Adapter] 翻译完成。");
     return googleRequest;
+  }
+
+  async _fetchRemoteImageAsInlineData(imageUrl) {
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const contentType = (response.headers.get("content-type") || "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (!contentType.startsWith("image/")) {
+      throw new Error(`不支持的 content-type: ${contentType || "unknown"}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    if (!base64) {
+      throw new Error("空图片数据");
+    }
+    return {
+      mimeType: contentType,
+      data: base64,
+    };
   }
 
   _translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-pro") {
